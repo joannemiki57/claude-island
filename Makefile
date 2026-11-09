@@ -8,17 +8,33 @@ APP   := $(BUILD)/$(APP_NAME).app
 BIN   := $(APP)/Contents/MacOS/$(APP_NAME)
 SRC   := Sources/ClaudeIsland.swift
 DEST  := /Applications/$(APP_NAME).app
+ICON_PNG := Resources/icon/icon_1024.png
+ICONSET  := $(BUILD)/AppIcon.iconset
+ICNS     := $(BUILD)/AppIcon.icns
 
 SWIFTC := swiftc -O -swift-version 5 -framework AppKit -framework SwiftUI
 
-.PHONY: all build run demo install login unlogin uninstall zip clean
+.PHONY: all build run demo install login unlogin uninstall zip clean icon
 
 all: build
 
 build: $(BIN)
 
-$(BIN): $(SRC) Makefile
-	@mkdir -p $(BUILD) $(APP)/Contents/MacOS
+# Regenerate the artwork with `make icon` after editing make_icon.swift.
+icon:
+	cd Resources/icon && swift make_icon.swift icon_1024.png
+
+$(ICNS): $(ICON_PNG)
+	@mkdir -p $(ICONSET)
+	@for s in 16 32 128 256 512; do \
+		sips -z $$s $$s $(ICON_PNG) --out $(ICONSET)/icon_$${s}x$${s}.png >/dev/null; \
+		d=$$((s * 2)); sips -z $$d $$d $(ICON_PNG) --out $(ICONSET)/icon_$${s}x$${s}@2x.png >/dev/null; \
+	done
+	iconutil -c icns $(ICONSET) -o $(ICNS)
+
+$(BIN): $(SRC) $(ICNS) Makefile Resources/Info.plist
+	@mkdir -p $(BUILD) $(APP)/Contents/MacOS $(APP)/Contents/Resources
+	@cp $(ICNS) $(APP)/Contents/Resources/AppIcon.icns
 	$(SWIFTC) -target arm64-apple-macos$(MIN_MACOS) -o $(BUILD)/$(APP_NAME)-arm64 $(SRC)
 	$(SWIFTC) -target x86_64-apple-macos$(MIN_MACOS) -o $(BUILD)/$(APP_NAME)-x86_64 $(SRC)
 	lipo -create -output $(BIN) $(BUILD)/$(APP_NAME)-arm64 $(BUILD)/$(APP_NAME)-x86_64

@@ -1,4 +1,6 @@
-# Claude Island
+<p align="center"><img src="docs/icon.png" width="128" alt="Claude Island icon"></p>
+
+<h1 align="center">Claude Island</h1>
 
 A tiny macOS app that lives in the notch and shows what your Claude desktop sessions are doing.
 
