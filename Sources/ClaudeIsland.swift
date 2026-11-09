@@ -1,5 +1,6 @@
 // Claude Island: a notch ("dynamic island") widget that shows which Claude Code
-// desktop sessions are running and which finished turns you haven't read yet.
+// desktop sessions are running, which are waiting on you, and which finished
+// turns you haven't read yet.
 // Data source: ~/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json
 // Click a row -> claude://claude.ai/epitaxy/<sessionId> opens that conversation.
 
@@ -15,6 +16,8 @@ struct SessionItem: Identifiable, Equatable {
     let running: Bool
     let background: Bool    // turn is over but background shells/subagents are still working
     let edgeAt: Double      // ms epoch of the last turn edge (start or end)
+    var waiting = false     // needs your input: a question, a plan to approve, a permission prompt
+    var note: String? = nil // what it needs from you (shown under the title)
 }
 
 private struct ParsedSession {
@@ -27,9 +30,17 @@ private struct ParsedSession {
     let isRoutine: Bool     // scheduled-task run
     let cliSessionId: String
     let cwds: [String]
+    let permissionMode: String
+    let blockedNote: String?  // set when the last turn ended asking you for something
+}
+
+private struct PendingTool {
+    let name: String
+    let question: String?
 }
 
 final class SessionStore: ObservableObject {
+    @Published private(set) var waiting: [SessionItem] = []
     @Published private(set) var running: [SessionItem] = []
     @Published private(set) var unread: [SessionItem] = []
 
@@ -73,6 +84,10 @@ final class SessionStore: ObservableObject {
 
     private func loadDemo() {
         let now = Date().timeIntervalSince1970 * 1000
+        waiting = [
+            SessionItem(id: "demo-0", title: "Migrate the users table", running: false, background: false, edgeAt: now - 60_000,
+                        waiting: true, note: "Okay to run the migration on staging?"),
+        ]
         running = [
             SessionItem(id: "demo-1", title: "Refactor the auth middleware", running: true, background: false, edgeAt: now - 4 * 60_000),
             SessionItem(id: "demo-2", title: "Nightly data import", running: true, background: true, edgeAt: now - 52 * 60_000),
@@ -86,6 +101,7 @@ final class SessionStore: ObservableObject {
     func markSeen(_ ids: [String]) {
         if isDemo {
             unread.removeAll { ids.contains($0.id) }
+            waiting.removeAll { ids.contains($0.id) }
             return
         }
         let now = Date().timeIntervalSince1970 * 1000
@@ -97,13 +113,28 @@ final class SessionStore: ObservableObject {
         refresh()
     }
 
-    func dismiss(_ item: SessionItem) { markSeen([item.id]) }
+    // Waiting chats stay listed (even after you look at them) until you reply,
+    // unless you hide them here. Keyed by the turn edge so the next ask shows again.
+    private var dismissedWaiting: [String: Double] {
+        get { UserDefaults.standard.dictionary(forKey: "dismissedWaiting") as? [String: Double] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: "dismissedWaiting") }
+    }
+
+    func dismiss(_ item: SessionItem) {
+        guard item.waiting else { markSeen([item.id]); return }
+        if isDemo { waiting.removeAll { $0.id == item.id }; return }
+        var d = dismissedWaiting
+        d[item.id] = item.edgeAt
+        dismissedWaiting = d.filter { Date().timeIntervalSince1970 * 1000 - $0.value < 7 * 86400_000 }
+        refresh()
+    }
     func dismissAllUnread() { markSeen(unread.map(\.id)) }
 
     func refresh() {
         guard !isDemo else { return }
         let seenSnapshot = seen
         let dismissedExplicitSnapshot = dismissedExplicit
+        let dismissedWaitingSnapshot = dismissedWaiting
         let claudeFront = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.claudeBundleId
         queue.async { [weak self] in
             guard let self else { return }
@@ -118,8 +149,9 @@ final class SessionStore: ObservableObject {
             }
             let background = self.backgroundSessionIds(sessions)
             let app = self.appUnread.read()
-            let (run, unr) = Self.classify(sessions, seen: seenNow, background: background,
-                                           app: app, dismissedExplicit: dismissedExplicitSnapshot)
+            let (wait, run, unr) = self.classify(sessions, seen: seenNow, busy: background, app: app,
+                                                 dismissedExplicit: dismissedExplicitSnapshot,
+                                                 dismissedWaiting: dismissedWaitingSnapshot)
             DispatchQueue.main.async {
                 if let app {
                     self.lastExplicit = app.explicit
@@ -131,6 +163,7 @@ final class SessionStore: ObservableObject {
                     s[w] = seenNow[w]
                     self.seen = s
                 }
+                if wait != self.waiting { self.waiting = wait }
                 if run != self.running { self.running = run }
                 if unr != self.unread { self.unread = unr }
             }
@@ -171,6 +204,16 @@ final class SessionStore: ObservableObject {
         func num(_ k: String) -> Double { (obj[k] as? NSNumber)?.doubleValue ?? 0 }
         let rawTitle = (obj["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let taskId = (obj["scheduledTaskId"] as? String) ?? ""
+        // postTurnSummary is Claude's own one-line status for the last turn. "blocked"
+        // with a needs_action means the turn ended waiting on you.
+        var blockedNote: String? = nil
+        if let summary = obj["postTurnSummary"] as? [String: Any],
+           summary["status_category"] as? String == "blocked",
+           let forId = obj["postTurnSummaryFor"] as? String, forId == obj["lastAssistantUuid"] as? String {
+            let action = (summary["needs_action"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let detail = (summary["status_detail"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            blockedNote = !action.isEmpty ? action : (!detail.isEmpty ? detail : "Waiting for your reply")
+        }
         return ParsedSession(
             id: id,
             title: rawTitle.isEmpty ? "New session" : rawTitle,
@@ -180,7 +223,9 @@ final class SessionStore: ObservableObject {
             focusAt: num("lastFocusedAt"),
             isRoutine: !taskId.isEmpty,
             cliSessionId: (obj["cliSessionId"] as? String) ?? "",
-            cwds: [obj["cwd"] as? String, obj["originCwd"] as? String].compactMap { $0 }
+            cwds: [obj["cwd"] as? String, obj["originCwd"] as? String].compactMap { $0 },
+            permissionMode: (obj["permissionMode"] as? String) ?? "",
+            blockedNote: blockedNote
         )
     }
 
@@ -260,16 +305,96 @@ final class SessionStore: ObservableObject {
         return result
     }
 
+    // MARK: Waiting on you, mid-turn
+
+    private var transcriptCache: [String: (Date, Int, PendingTool?)] = [:]
+
+    private static func transcriptURLs(_ s: ParsedSession) -> [URL] {
+        let projects = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+        return Set(s.cwds).map { cwd in
+            let encoded = String(cwd.map { $0.isASCII && ($0.isLetter || $0.isNumber) ? $0 : "-" })
+            return projects.appendingPathComponent(encoded).appendingPathComponent(s.cliSessionId + ".jsonl")
+        }
+    }
+
+    // The newest tool call in the session transcript that has no result yet, plus
+    // how long the transcript has been quiet. A question or plan approval shows up
+    // as a pending AskUserQuestion / ExitPlanMode call; a permission prompt shows
+    // up as any other call that sits there with nothing else happening.
+    private func pendingTool(_ s: ParsedSession) -> (PendingTool, TimeInterval)? {
+        guard !s.cliSessionId.isEmpty else { return nil }
+        for url in Self.transcriptURLs(s) {
+            guard let rv = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
+                  let mtime = rv.contentModificationDate, let size = rv.fileSize else { continue }
+            let idle = Date().timeIntervalSince(mtime)
+            if let c = transcriptCache[url.path], c.0 == mtime, c.1 == size {
+                return c.2.map { ($0, idle) }
+            }
+            let found = autoreleasepool { Self.scanPending(url, size: size) }
+            transcriptCache[url.path] = (mtime, size, found)
+            return found.map { ($0, idle) }
+        }
+        return nil
+    }
+
+    private static func scanPending(_ url: URL, size: Int) -> PendingTool? {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? fh.close() }
+        let tail = 512 * 1024
+        let offset = max(0, size - tail)
+        try? fh.seek(toOffset: UInt64(offset))
+        guard let data = try? fh.readToEnd() else { return nil }
+        var lines = data.split(separator: UInt8(ascii: "\n"))
+        if offset > 0, !lines.isEmpty { lines.removeFirst() }  // partial first line
+        var order: [String] = []
+        var pending: [String: PendingTool] = [:]
+        for line in lines {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                  (obj["isSidechain"] as? Bool) != true,
+                  let type = obj["type"] as? String, type == "assistant" || type == "user",
+                  let msg = obj["message"] as? [String: Any],
+                  let content = msg["content"] as? [[String: Any]] else { continue }
+            for c in content {
+                if type == "assistant", c["type"] as? String == "tool_use",
+                   let id = c["id"] as? String, let name = c["name"] as? String {
+                    var question: String? = nil
+                    if name == "AskUserQuestion", let input = c["input"] as? [String: Any],
+                       let qs = input["questions"] as? [[String: Any]], let q = qs.first?["question"] as? String {
+                        question = q
+                    }
+                    pending[id] = PendingTool(name: name, question: question)
+                    order.append(id)
+                } else if type == "user", c["type"] as? String == "tool_result", let id = c["tool_use_id"] as? String {
+                    pending[id] = nil
+                }
+            }
+        }
+        for id in order.reversed() { if let p = pending[id] { return p } }
+        return nil
+    }
+
+    private static func shortToolName(_ name: String) -> String {
+        guard name.hasPrefix("mcp__") else { return name }
+        return name.split(separator: "_", omittingEmptySubsequences: true).last.map(String.init) ?? name
+    }
+
     // A turn is in flight when the newest user message arrived at or after the
     // last turn edge (the edge is rewritten again when the turn ends).
     // Unread comes from Claude's own sidebar state (blue dots + hand marks) when it
     // can be read; otherwise falls back to comparing turn-end and focus times.
-    private static func classify(_ sessions: [ParsedSession], seen: [String: Double], background: Set<String>,
-                                 app: AppUnreadState?, dismissedExplicit: Set<String>) -> ([SessionItem], [SessionItem]) {
+    private func classify(_ sessions: [ParsedSession], seen: [String: Double], busy: Set<String>,
+                          app: AppUnreadState?, dismissedExplicit: Set<String>,
+                          dismissedWaiting: [String: Double]) -> ([SessionItem], [SessionItem], [SessionItem]) {
         let now = Date().timeIntervalSince1970 * 1000
-        let claudeUp = !NSRunningApplication.runningApplications(withBundleIdentifier: claudeBundleId).isEmpty
+        let claudeUp = !NSRunningApplication.runningApplications(withBundleIdentifier: Self.claudeBundleId).isEmpty
+        var waiting: [SessionItem] = []
         var running: [SessionItem] = []
         var unread: [SessionItem] = []
+        func wait(_ s: ParsedSession, _ note: String) {
+            if let d = dismissedWaiting[s.id], d >= s.edgeAt { return }
+            waiting.append(SessionItem(id: s.id, title: s.title, running: false, background: false,
+                                       edgeAt: s.edgeAt, waiting: true, note: note))
+        }
 
         for s in sessions where !s.archived {
             let handMarked = app?.explicit.contains(s.id) ?? false
@@ -278,12 +403,29 @@ final class SessionStore: ObservableObject {
             if s.edgeAt <= 0 && !handMarked { continue }
             let item = SessionItem(id: s.id, title: s.title, running: false, background: false, edgeAt: s.edgeAt)
             if claudeUp && s.userAt >= s.edgeAt && now - s.edgeAt < 12 * 3600_000 {
+                if let (tool, idle) = pendingTool(s) {
+                    if tool.name == "AskUserQuestion" {
+                        wait(s, tool.question ?? "Has a question for you"); continue
+                    }
+                    if tool.name == "ExitPlanMode" {
+                        wait(s, "Plan is ready for your review"); continue
+                    }
+                    // Auto and bypass modes never stop to ask, so only guess a
+                    // permission prompt in the other modes.
+                    let asksPermission = !["auto", "bypassPermissions"].contains(s.permissionMode)
+                    if asksPermission && idle > 20 && !busy.contains(s.id) {
+                        wait(s, "Wants permission to use \(Self.shortToolName(tool.name))"); continue
+                    }
+                }
                 running.append(SessionItem(id: s.id, title: s.title, running: true, background: false, edgeAt: s.edgeAt))
                 continue
             }
-            if background.contains(s.id) {
+            if busy.contains(s.id) {
                 running.append(SessionItem(id: s.id, title: s.title, running: true, background: true, edgeAt: s.edgeAt))
                 continue
+            }
+            if let note = s.blockedNote, !s.isRoutine, now - s.edgeAt < 48 * 3600_000 {
+                wait(s, note); continue
             }
             if let app {
                 if handMarked {
@@ -299,7 +441,9 @@ final class SessionStore: ObservableObject {
                 }
             }
         }
-        return (running.sorted { $0.edgeAt > $1.edgeAt }, unread.sorted { $0.edgeAt > $1.edgeAt })
+        return (waiting.sorted { $0.edgeAt > $1.edgeAt },
+                running.sorted { $0.edgeAt > $1.edgeAt },
+                unread.sorted { $0.edgeAt > $1.edgeAt })
     }
 }
 
@@ -520,17 +664,36 @@ final class IslandState: ObservableObject {
     @Published var notchWidth: CGFloat = 180
     @Published var notchHeight: CGFloat = 32
     @Published var hasNotch = true
+    @Published var peek: SessionItem? = nil   // a chat that just started waiting on you
 }
 
 enum Layout {
     static let sideWing: CGFloat = 30
     static let expandedWidth: CGFloat = 420
     static let rowHeight: CGFloat = 30
-    static let maxRows = 12
+    static let noteRowHeight: CGFloat = 42
+    static let maxListHeight: CGFloat = 400
+    static let peekHeight: CGFloat = 50
+
+    static func height(of item: SessionItem) -> CGFloat {
+        (item.note != nil ? noteRowHeight : rowHeight) + 2
+    }
+
+    static func listHeight(_ items: [SessionItem]) -> CGFloat {
+        min(items.reduce(0) { $0 + height(of: $1) }, maxListHeight)
+    }
+
+    // Both wings share one width so the island stays centered on the notch.
+    static func wing(_ store: SessionStore) -> CGFloat {
+        let left: CGFloat = store.running.isEmpty ? 0 : sideWing
+        let right: CGFloat = (store.waiting.isEmpty ? 0 : sideWing) + (store.unread.isEmpty ? 0 : sideWing)
+        return max(left, right)
+    }
 }
 
 let claudeOrange = Color(red: 0.85, green: 0.47, blue: 0.34)
 let unreadBlue = Color(red: 0.30, green: 0.62, blue: 1.0)
+let waitingAmber = Color(red: 1.0, green: 0.74, blue: 0.25)
 
 // MARK: - Views
 
@@ -569,6 +732,22 @@ struct Spinner: View {
     }
 }
 
+struct PulseDot: View {
+    var size: CGFloat = 8
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 20)) { ctx in
+            let phase = ctx.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.4) / 1.4
+            ZStack {
+                Circle()
+                    .stroke(waitingAmber.opacity(0.7 * (1 - phase)), lineWidth: 1.5)
+                    .frame(width: size * (1 + phase * 1.2), height: size * (1 + phase * 1.2))
+                Circle().fill(waitingAmber).frame(width: size, height: size)
+            }
+            .frame(width: size * 2.4, height: size * 2.4)
+        }
+    }
+}
+
 struct CollapsedView: View {
     @ObservedObject var store: SessionStore
     @ObservedObject var state: IslandState
@@ -580,15 +759,23 @@ struct CollapsedView: View {
                     Text("\(store.running.count)").font(.system(size: 11, weight: .semibold)).foregroundColor(claudeOrange)
                 }
             }
-            .frame(width: Layout.sideWing)
+            .frame(width: Layout.wing(store))
             Spacer(minLength: 0)
-            HStack(spacing: 4) {
+            HStack(spacing: 6) {
+                if !store.waiting.isEmpty {
+                    HStack(spacing: 2) {
+                        PulseDot(size: 7)
+                        Text("\(store.waiting.count)").font(.system(size: 11, weight: .bold)).foregroundColor(waitingAmber)
+                    }
+                }
                 if !store.unread.isEmpty {
-                    Circle().fill(unreadBlue).frame(width: 7, height: 7)
-                    Text("\(store.unread.count)").font(.system(size: 11, weight: .semibold)).foregroundColor(unreadBlue)
+                    HStack(spacing: 4) {
+                        Circle().fill(unreadBlue).frame(width: 7, height: 7)
+                        Text("\(store.unread.count)").font(.system(size: 11, weight: .semibold)).foregroundColor(unreadBlue)
+                    }
                 }
             }
-            .frame(width: Layout.sideWing)
+            .frame(width: Layout.wing(store))
         }
         .padding(.horizontal, 4)
         .frame(height: state.notchHeight)
@@ -604,14 +791,26 @@ struct RowView: View {
     var body: some View {
         HStack(spacing: 9) {
             ZStack {
-                if item.running { Spinner(size: 11) } else { Circle().fill(unreadBlue).frame(width: 7, height: 7) }
+                if item.waiting { PulseDot(size: 7) }
+                else if item.running { Spinner(size: 11) }
+                else { Circle().fill(unreadBlue).frame(width: 7, height: 7) }
             }
             .frame(width: 14)
-            Text(item.title)
-                .font(.system(size: 12.5, weight: item.running ? .medium : .semibold))
-                .foregroundColor(.white)
-                .lineLimit(1)
-                .truncationMode(.tail)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title)
+                    .font(.system(size: 12.5, weight: item.running ? .medium : .semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                if let note = item.note {
+                    Text(note)
+                        .font(.system(size: 11))
+                        .foregroundColor(waitingAmber.opacity(0.85))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            .help(item.note ?? item.title)
             Spacer(minLength: 6)
             if hover && !item.running {
                 Button(action: { dismiss(item) }) {
@@ -620,15 +819,15 @@ struct RowView: View {
                         .foregroundColor(.white.opacity(0.7))
                 }
                 .buttonStyle(.plain)
-                .help("Mark as read")
+                .help(item.waiting ? "Hide until it asks again" : "Mark as read")
             } else {
                 Text(relative(item))
-                    .font(.system(size: 11, design: .rounded))
-                    .foregroundColor(.white.opacity(0.45))
+                    .font(.system(size: 11, weight: item.waiting ? .semibold : .regular, design: .rounded))
+                    .foregroundColor(item.waiting ? waitingAmber : .white.opacity(0.45))
             }
         }
         .padding(.horizontal, 10)
-        .frame(height: Layout.rowHeight)
+        .frame(height: Layout.height(of: item) - 2)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(hover ? 0.12 : 0)))
         .contentShape(Rectangle())
         .onHover { hover = $0 }
@@ -642,6 +841,7 @@ struct RowView: View {
         else if secs < 3600 { text = "\(Int(secs / 60))m" }
         else if secs < 86400 { text = "\(Int(secs / 3600))h" }
         else { text = "\(Int(secs / 86400))d" }
+        if item.waiting { return "needs you" }
         if item.background { return "background" }
         if item.running { return text.isEmpty ? "running" : "running \(text)" }
         return text.isEmpty ? "just now" : "\(text) ago"
@@ -653,7 +853,7 @@ struct ExpandedView: View {
     @ObservedObject var state: IslandState
     let open: (SessionItem) -> Void
 
-    var items: [SessionItem] { store.running + store.unread }
+    var items: [SessionItem] { store.waiting + store.running + store.unread }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -672,7 +872,7 @@ struct ExpandedView: View {
             .frame(height: state.notchHeight)
 
             if items.isEmpty {
-                Text("Nothing running, nothing unread")
+                Text("All quiet. Nothing running or waiting.")
                     .font(.system(size: 12))
                     .foregroundColor(.white.opacity(0.5))
                     .frame(height: Layout.rowHeight + 8)
@@ -684,11 +884,44 @@ struct ExpandedView: View {
                         }
                     }
                 }
-                .frame(height: CGFloat(min(items.count, Layout.maxRows)) * (Layout.rowHeight + 2))
+                .frame(height: Layout.listHeight(items))
             }
         }
         .padding(.horizontal, 8)
         .padding(.bottom, 10)
+    }
+}
+
+struct PeekView: View {
+    let item: SessionItem
+    @ObservedObject var state: IslandState
+    let open: (SessionItem) -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Color.clear.frame(height: state.notchHeight)
+            HStack(spacing: 10) {
+                PulseDot(size: 8)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.title)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                    Text(item.note ?? "Needs you")
+                        .font(.system(size: 11))
+                        .foregroundColor(waitingAmber.opacity(0.9))
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 6)
+                Text("needs you")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundColor(waitingAmber)
+            }
+            .padding(.horizontal, 18)
+            .frame(height: Layout.peekHeight - 8)
+            .contentShape(Rectangle())
+            .onTapGesture { open(item) }
+        }
     }
 }
 
@@ -699,9 +932,12 @@ struct IslandRoot: View {
 
     var body: some View {
         ZStack(alignment: .top) {
-            IslandShape(bottomRadius: state.expanded ? 20 : 10).fill(Color.black)
+            IslandShape(bottomRadius: state.expanded || state.peek != nil ? 20 : 10).fill(Color.black)
             if state.expanded {
                 ExpandedView(store: store, state: state, open: open)
+                    .transition(.opacity)
+            } else if let item = state.peek {
+                PeekView(item: item, state: state, open: open)
                     .transition(.opacity)
             } else {
                 CollapsedView(store: store, state: state)
@@ -709,6 +945,7 @@ struct IslandRoot: View {
             }
         }
         .animation(.easeOut(duration: 0.18), value: state.expanded)
+        .animation(.easeOut(duration: 0.18), value: state.peek?.id)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 }
@@ -747,6 +984,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var host: HostingView<IslandRoot>!
     var bag = Set<AnyCancellable>()
     var collapseWork: DispatchWorkItem?
+    var peekWork: DispatchWorkItem?
+    var knownWaiting: Set<String>? = nil   // nil until the first scan, so launch doesn't peek
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         panel = IslandPanel(contentRect: NSRect(x: 0, y: 0, width: 200, height: 32),
@@ -766,9 +1005,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         host.onRightClick = { [weak self] e in self?.showMenu(e) }
         panel.contentView = host
 
-        store.$running.combineLatest(store.$unread)
+        store.$running.combineLatest(store.$unread, store.$waiting)
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.layout(animated: true) }
+            .store(in: &bag)
+        store.$waiting
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] items in self?.waitingChanged(items) }
             .store(in: &bag)
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             self?.layout(animated: false)
@@ -777,6 +1021,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         layout(animated: false)
         panel.orderFrontRegardless()
         store.start()
+        if store.isDemo && CommandLine.arguments.contains("--peek"), let w = store.waiting.first {
+            knownWaiting = []
+            waitingChanged([w])
+        }
     }
 
     private var screen: NSScreen {
@@ -800,12 +1048,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         measureNotch()
         let size: NSSize
         if state.expanded {
-            let n = store.running.count + store.unread.count
-            let rows = n == 0 ? Layout.rowHeight + 8 : CGFloat(min(n, Layout.maxRows)) * (Layout.rowHeight + 2)
+            let items = store.waiting + store.running + store.unread
+            let rows = items.isEmpty ? Layout.rowHeight + 8 : Layout.listHeight(items)
             size = NSSize(width: max(Layout.expandedWidth, state.notchWidth + 120), height: state.notchHeight + rows + 10)
+        } else if state.peek != nil {
+            size = NSSize(width: max(Layout.expandedWidth - 40, state.notchWidth + 120), height: state.notchHeight + Layout.peekHeight)
         } else {
-            let wings = (store.running.isEmpty && store.unread.isEmpty) ? 0 : (Layout.sideWing + 4) * 2
-            size = NSSize(width: state.notchWidth + wings, height: state.notchHeight)
+            let wing = Layout.wing(store)
+            size = NSSize(width: state.notchWidth + (wing > 0 ? (wing + 4) * 2 : 0), height: state.notchHeight)
         }
         let f = screen.frame
         let frame = NSRect(x: f.midX - size.width / 2, y: f.maxY - size.height, width: size.width, height: size.height)
@@ -823,6 +1073,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func setExpanded(_ on: Bool) {
         collapseWork?.cancel()
         guard state.expanded != on else { return }
+        if on { endPeek(relayout: false) }
         state.expanded = on
         if on { store.refresh() }
         layout(animated: true)
@@ -840,13 +1091,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
+    // A chat just started waiting on you: drop the island down for a few seconds.
+    func waitingChanged(_ items: [SessionItem]) {
+        let keys = Set(items.map { "\($0.id)@\($0.edgeAt)" })
+        defer { knownWaiting = keys }
+        guard let known = knownWaiting else { return }
+        guard !state.expanded,
+              let fresh = items.first(where: { !known.contains("\($0.id)@\($0.edgeAt)") }) else { return }
+        state.peek = fresh
+        layout(animated: true)
+        peekWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.endPeek(relayout: true) }
+        peekWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: work)
+    }
+
+    func endPeek(relayout: Bool) {
+        peekWork?.cancel()
+        guard state.peek != nil else { return }
+        state.peek = nil
+        if relayout { layout(animated: true) }
+    }
+
     func open(_ item: SessionItem) {
-        if store.isDemo { setExpanded(false); return }
+        endPeek(relayout: false)
+        if store.isDemo { setExpanded(false); layout(animated: true); return }
         if let url = URL(string: "claude://claude.ai/epitaxy/\(item.id)") {
             NSWorkspace.shared.open(url)
         }
-        store.markSeen([item.id])
+        if !item.waiting { store.markSeen([item.id]) }
         setExpanded(false)
+        layout(animated: true)
         // The app writes lastFocusedAt once the conversation is shown; rescan shortly after.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.store.refresh() }
     }
