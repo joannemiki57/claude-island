@@ -39,8 +39,14 @@ private struct PendingTool {
     let question: String?
 }
 
+private struct TranscriptState {
+    let pending: PendingTool?   // newest tool call with no result yet
+    let turnOpen: Bool          // the last message is not a finished reply
+}
+
 final class SessionStore: ObservableObject {
     @Published private(set) var waiting: [SessionItem] = []
+    private(set) var currentSessionId: String? = nil   // conversation open in Claude right now
     @Published private(set) var running: [SessionItem] = []
     @Published private(set) var unread: [SessionItem] = []
 
@@ -114,6 +120,16 @@ final class SessionStore: ObservableObject {
     }
 
     func dismiss(_ item: SessionItem) { markSeen([item.id]) }
+
+    // `ClaudeIsland --dump` prints one classification pass (for troubleshooting).
+    func dump() {
+        let sessions = scan()
+        let (w, r, u) = classify(sessions, seen: seen, busy: backgroundSessionIds(sessions),
+                                 app: appUnread.read(), dismissedExplicit: dismissedExplicit)
+        for i in w { print("waiting     \(i.title)  |  \(i.note ?? "")") }
+        for i in r { print(i.background ? "background  \(i.title)" : "running     \(i.title)") }
+        for i in u { print("unread      \(i.title)") }
+    }
     func dismissAllUnread() { markSeen(unread.map(\.id)) }
 
     func refresh() {
@@ -126,6 +142,7 @@ final class SessionStore: ObservableObject {
             let sessions = self.scan()
             // The conversation currently open in Claude is the most recently focused one.
             let current = sessions.filter { !$0.archived }.max { $0.focusAt < $1.focusAt }
+            let currentId = current?.id
             var seenNow = seenSnapshot
             var watchedId: String? = nil
             if claudeFront, let c = current {
@@ -137,6 +154,7 @@ final class SessionStore: ObservableObject {
             let (wait, run, unr) = self.classify(sessions, seen: seenNow, busy: background, app: app,
                                                  dismissedExplicit: dismissedExplicitSnapshot)
             DispatchQueue.main.async {
+                self.currentSessionId = currentId
                 if let app {
                     self.lastExplicit = app.explicit
                     let pruned = self.dismissedExplicit.intersection(app.explicit)
@@ -291,7 +309,7 @@ final class SessionStore: ObservableObject {
 
     // MARK: Waiting on you, mid-turn
 
-    private var transcriptCache: [String: (Date, Int, PendingTool?)] = [:]
+    private var transcriptCache: [String: (Date, Int, TranscriptState?)] = [:]
 
     private static func transcriptURLs(_ s: ParsedSession) -> [URL] {
         let projects = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
@@ -301,11 +319,11 @@ final class SessionStore: ObservableObject {
         }
     }
 
-    // The newest tool call in the session transcript that has no result yet, plus
-    // how long the transcript has been quiet. A question or plan approval shows up
-    // as a pending AskUserQuestion / ExitPlanMode call; a permission prompt shows
-    // up as any other call that sits there with nothing else happening.
-    private func pendingTool(_ s: ParsedSession) -> (PendingTool, TimeInterval)? {
+    // Reads the end of the session transcript: the newest tool call with no result
+    // yet, whether the turn is still open, and how long the file has been quiet.
+    // A question or plan approval shows up as a pending AskUserQuestion /
+    // ExitPlanMode call; a permission prompt as any other call that just sits there.
+    private func transcriptState(_ s: ParsedSession) -> (TranscriptState, TimeInterval)? {
         guard !s.cliSessionId.isEmpty else { return nil }
         for url in Self.transcriptURLs(s) {
             guard let rv = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
@@ -314,14 +332,14 @@ final class SessionStore: ObservableObject {
             if let c = transcriptCache[url.path], c.0 == mtime, c.1 == size {
                 return c.2.map { ($0, idle) }
             }
-            let found = autoreleasepool { Self.scanPending(url, size: size) }
+            let found = autoreleasepool { Self.scanTranscript(url, size: size) }
             transcriptCache[url.path] = (mtime, size, found)
             return found.map { ($0, idle) }
         }
         return nil
     }
 
-    private static func scanPending(_ url: URL, size: Int) -> PendingTool? {
+    private static func scanTranscript(_ url: URL, size: Int) -> TranscriptState? {
         guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? fh.close() }
         let tail = 512 * 1024
@@ -332,12 +350,28 @@ final class SessionStore: ObservableObject {
         if offset > 0, !lines.isEmpty { lines.removeFirst() }  // partial first line
         var order: [String] = []
         var pending: [String: PendingTool] = [:]
+        var turnOpen = false
+        var sawMessage = false
+        var toolNames: [String: String] = [:]
         for line in lines {
             guard let obj = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
                   (obj["isSidechain"] as? Bool) != true,
                   let type = obj["type"] as? String, type == "assistant" || type == "user",
-                  let msg = obj["message"] as? [String: Any],
-                  let content = msg["content"] as? [[String: Any]] else { continue }
+                  let msg = obj["message"] as? [String: Any] else { continue }
+            sawMessage = true
+            if type == "assistant" {
+                let stop = msg["stop_reason"] as? String ?? ""
+                turnOpen = !["end_turn", "stop_sequence", "max_tokens", "refusal"].contains(stop)
+            } else if let text = msg["content"] as? String {
+                turnOpen = !text.hasPrefix("[Request interrupted")
+            } else if let parts = msg["content"] as? [[String: Any]],
+                      let t = parts.first(where: { $0["type"] as? String == "text" })?["text"] as? String,
+                      t.hasPrefix("[Request interrupted") {
+                turnOpen = false
+            } else {
+                turnOpen = true
+            }
+            guard let content = msg["content"] as? [[String: Any]] else { continue }
             for c in content {
                 if type == "assistant", c["type"] as? String == "tool_use",
                    let id = c["id"] as? String, let name = c["name"] as? String {
@@ -347,13 +381,27 @@ final class SessionStore: ObservableObject {
                         question = q
                     }
                     pending[id] = PendingTool(name: name, question: question)
+                    toolNames[id] = name
                     order.append(id)
                 } else if type == "user", c["type"] as? String == "tool_result", let id = c["tool_use_id"] as? String {
                     pending[id] = nil
+                    // The desktop app's wrap-up card can be the last thing in a turn.
+                    if toolNames[id]?.hasSuffix("__wrap_up") == true { turnOpen = false }
                 }
             }
         }
-        for id in order.reversed() { if let p = pending[id] { return p } }
+        guard sawMessage else { return nil }
+        let newest = order.reversed().lazy.compactMap { pending[$0] }.first
+        return TranscriptState(pending: newest, turnOpen: turnOpen)
+    }
+
+    // Tools that show an approval card in every permission mode, auto included.
+    private static func alwaysAsks(_ name: String) -> String? {
+        if name.hasSuffix("__request_access") || name.hasSuffix("__request_full_control")
+            || name.hasSuffix("__request_teach_access") {
+            return "Wants permission to control apps on your Mac"
+        }
+        if name.hasSuffix("__request_directory") { return "Wants access to a folder" }
         return nil
     }
 
@@ -386,25 +434,32 @@ final class SessionStore: ObservableObject {
             if s.isRoutine && !handMarked { continue }
             if s.edgeAt <= 0 && !handMarked { continue }
             let item = SessionItem(id: s.id, title: s.title, running: false, background: false, edgeAt: s.edgeAt)
-            if claudeUp && s.userAt >= s.edgeAt && now - s.edgeAt < 12 * 3600_000 {
-                if let (tool, idle) = pendingTool(s) {
-                    // Already looked at since it started waiting: treat as read and leave it out.
-                    let pendingSince = now - idle * 1000
-                    let isQuestion = tool.name == "AskUserQuestion" || tool.name == "ExitPlanMode"
-                    let askedPermission = !["auto", "bypassPermissions"].contains(s.permissionMode)
-                        && idle > 20 && !busy.contains(s.id)
-                    if (isQuestion || askedPermission) && max(s.focusAt, seen[s.id] ?? 0) >= pendingSince {
-                        continue
-                    }
+            // Approving a card also stamps the turn edge, so the timestamps alone can
+            // say "done" while the turn is still going. The transcript settles it.
+            let recent = claudeUp && now - s.edgeAt < 12 * 3600_000
+            let transcript = recent ? transcriptState(s) : nil
+            let openInTranscript: Bool = {
+                guard let (t, idle) = transcript, t.turnOpen else { return false }
+                return t.pending != nil || idle < 300
+            }()
+            if recent && (s.userAt >= s.edgeAt || openInTranscript) {
+                // A card that stops the turn until you act stays amber until you
+                // answer it, even if you have already seen it.
+                if let (state, idle) = transcript, let tool = state.pending {
                     if tool.name == "AskUserQuestion" {
                         wait(s, tool.question ?? "Has a question for you"); continue
                     }
                     if tool.name == "ExitPlanMode" {
                         wait(s, "Plan is ready for your review"); continue
                     }
-                    // Auto and bypass modes never stop to ask, so only guess a
-                    // permission prompt in the other modes.
-                    if askedPermission {
+                    if let note = Self.alwaysAsks(tool.name), idle > 2 {
+                        wait(s, note); continue
+                    }
+                    // Other permission prompts are not written anywhere, so guess:
+                    // in modes that ask before acting, a call that sits with nothing
+                    // else going on is most likely waiting for approval.
+                    let asksFirst = !["auto", "bypassPermissions"].contains(s.permissionMode)
+                    if asksFirst && idle > 20 && !busy.contains(s.id) {
                         wait(s, "Wants permission to use \(Self.shortToolName(tool.name))"); continue
                     }
                 }
@@ -1089,8 +1144,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let keys = Set(items.map { "\($0.id)@\($0.edgeAt)" })
         defer { knownWaiting = keys }
         guard let known = knownWaiting else { return }
+        let claudeFront = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.anthropic.claudefordesktop"
         guard !state.expanded,
-              let fresh = items.first(where: { !known.contains("\($0.id)@\($0.edgeAt)") }) else { return }
+              let fresh = items.first(where: { !known.contains("\($0.id)@\($0.edgeAt)") }),
+              // No need to drop down for the chat you're already looking at.
+              !(claudeFront && fresh.id == store.currentSessionId) else { return }
         state.peek = fresh
         layout(animated: true)
         peekWork?.cancel()
@@ -1125,6 +1183,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quit)
         NSMenu.popUpContextMenu(menu, with: event, for: host)
     }
+}
+
+if CommandLine.arguments.contains("--dump") {
+    SessionStore().dump()
+    exit(0)
 }
 
 // `ClaudeIsland --dump-unread` prints what the widget reads from Claude's sidebar state.

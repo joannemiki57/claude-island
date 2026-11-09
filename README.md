@@ -59,7 +59,8 @@ Other targets: `make run`, `make demo`, `make uninstall`, `make zip`, `make clea
 | Spinner, `background` | The reply is done, but the session left a command or subagent running |
 | Blue dot, `5m ago` | Finished, and you haven't opened it yet |
 
-- Opening a conversation in Claude counts as reading it, and it leaves the list. That includes chats waiting on you: once you've seen the question, it's up to you when to answer.
+- Opening a conversation in Claude counts as reading it, and it leaves the list. A reply that ended by asking you something also counts as read once you've seen it.
+- Approval cards, question cards and plan approvals are different, since the session can't continue until you act. Those stay amber until you answer them.
 - Hover a row and click the check mark to hide it from the widget. "Mark all read" hides all unread rows. This only affects the widget, not Claude's sidebar.
 - Conversations you mark as unread in Claude's sidebar show up here too.
 - Right-click the island to quit.
@@ -92,7 +93,7 @@ These are internal files of the Claude app, not a public API. An app update coul
 - Only Code tab sessions are tracked, not regular chats.
 - Scheduled task runs are hidden, unless you mark one unread yourself.
 - Unread and waiting items older than 48 hours are left out (hand-marked unread ones always show).
-- Permission prompts aren't recorded anywhere, so they're inferred: in sessions that aren't in auto mode, a tool call that has been sitting for 20 seconds with nothing else running is treated as waiting for approval. A very slow tool can occasionally show up as "needs you" for a moment.
+- Permission prompts aren't recorded anywhere, so they're inferred. Requests that always ask (like letting Claude control apps on your Mac) are caught right away in any mode. Otherwise, in sessions that aren't in auto mode, a tool call that has been sitting for 20 seconds with nothing else running is treated as waiting for approval, so a very slow tool can occasionally show up as "needs you" for a moment.
 
 ## Troubleshooting
 
