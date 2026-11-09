@@ -59,7 +59,7 @@ Other targets: `make run`, `make demo`, `make uninstall`, `make zip`, `make clea
 | Spinner, `background` | The reply is done, but the session left a command or subagent running |
 | Blue dot, `5m ago` | Finished, and you haven't opened it yet |
 
-- Opening a conversation in Claude clears it from the unread list. Waiting chats stay until you answer them.
+- Opening a conversation in Claude counts as reading it, and it leaves the list. That includes chats waiting on you: once you've seen the question, it's up to you when to answer.
 - Hover a row and click the check mark to hide it from the widget. "Mark all read" hides all unread rows. This only affects the widget, not Claude's sidebar.
 - Conversations you mark as unread in Claude's sidebar show up here too.
 - Right-click the island to quit.

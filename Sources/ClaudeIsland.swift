@@ -113,28 +113,13 @@ final class SessionStore: ObservableObject {
         refresh()
     }
 
-    // Waiting chats stay listed (even after you look at them) until you reply,
-    // unless you hide them here. Keyed by the turn edge so the next ask shows again.
-    private var dismissedWaiting: [String: Double] {
-        get { UserDefaults.standard.dictionary(forKey: "dismissedWaiting") as? [String: Double] ?? [:] }
-        set { UserDefaults.standard.set(newValue, forKey: "dismissedWaiting") }
-    }
-
-    func dismiss(_ item: SessionItem) {
-        guard item.waiting else { markSeen([item.id]); return }
-        if isDemo { waiting.removeAll { $0.id == item.id }; return }
-        var d = dismissedWaiting
-        d[item.id] = item.edgeAt
-        dismissedWaiting = d.filter { Date().timeIntervalSince1970 * 1000 - $0.value < 7 * 86400_000 }
-        refresh()
-    }
+    func dismiss(_ item: SessionItem) { markSeen([item.id]) }
     func dismissAllUnread() { markSeen(unread.map(\.id)) }
 
     func refresh() {
         guard !isDemo else { return }
         let seenSnapshot = seen
         let dismissedExplicitSnapshot = dismissedExplicit
-        let dismissedWaitingSnapshot = dismissedWaiting
         let claudeFront = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.claudeBundleId
         queue.async { [weak self] in
             guard let self else { return }
@@ -150,8 +135,7 @@ final class SessionStore: ObservableObject {
             let background = self.backgroundSessionIds(sessions)
             let app = self.appUnread.read()
             let (wait, run, unr) = self.classify(sessions, seen: seenNow, busy: background, app: app,
-                                                 dismissedExplicit: dismissedExplicitSnapshot,
-                                                 dismissedWaiting: dismissedWaitingSnapshot)
+                                                 dismissedExplicit: dismissedExplicitSnapshot)
             DispatchQueue.main.async {
                 if let app {
                     self.lastExplicit = app.explicit
@@ -383,15 +367,15 @@ final class SessionStore: ObservableObject {
     // Unread comes from Claude's own sidebar state (blue dots + hand marks) when it
     // can be read; otherwise falls back to comparing turn-end and focus times.
     private func classify(_ sessions: [ParsedSession], seen: [String: Double], busy: Set<String>,
-                          app: AppUnreadState?, dismissedExplicit: Set<String>,
-                          dismissedWaiting: [String: Double]) -> ([SessionItem], [SessionItem], [SessionItem]) {
+                          app: AppUnreadState?, dismissedExplicit: Set<String>) -> ([SessionItem], [SessionItem], [SessionItem]) {
         let now = Date().timeIntervalSince1970 * 1000
         let claudeUp = !NSRunningApplication.runningApplications(withBundleIdentifier: Self.claudeBundleId).isEmpty
         var waiting: [SessionItem] = []
         var running: [SessionItem] = []
         var unread: [SessionItem] = []
+        // Once you've looked at a chat that is waiting on you, it counts as read
+        // and leaves the list, whether or not you answered.
         func wait(_ s: ParsedSession, _ note: String) {
-            if let d = dismissedWaiting[s.id], d >= s.edgeAt { return }
             waiting.append(SessionItem(id: s.id, title: s.title, running: false, background: false,
                                        edgeAt: s.edgeAt, waiting: true, note: note))
         }
@@ -404,6 +388,14 @@ final class SessionStore: ObservableObject {
             let item = SessionItem(id: s.id, title: s.title, running: false, background: false, edgeAt: s.edgeAt)
             if claudeUp && s.userAt >= s.edgeAt && now - s.edgeAt < 12 * 3600_000 {
                 if let (tool, idle) = pendingTool(s) {
+                    // Already looked at since it started waiting: treat as read and leave it out.
+                    let pendingSince = now - idle * 1000
+                    let isQuestion = tool.name == "AskUserQuestion" || tool.name == "ExitPlanMode"
+                    let askedPermission = !["auto", "bypassPermissions"].contains(s.permissionMode)
+                        && idle > 20 && !busy.contains(s.id)
+                    if (isQuestion || askedPermission) && max(s.focusAt, seen[s.id] ?? 0) >= pendingSince {
+                        continue
+                    }
                     if tool.name == "AskUserQuestion" {
                         wait(s, tool.question ?? "Has a question for you"); continue
                     }
@@ -412,8 +404,7 @@ final class SessionStore: ObservableObject {
                     }
                     // Auto and bypass modes never stop to ask, so only guess a
                     // permission prompt in the other modes.
-                    let asksPermission = !["auto", "bypassPermissions"].contains(s.permissionMode)
-                    if asksPermission && idle > 20 && !busy.contains(s.id) {
+                    if askedPermission {
                         wait(s, "Wants permission to use \(Self.shortToolName(tool.name))"); continue
                     }
                 }
@@ -424,21 +415,23 @@ final class SessionStore: ObservableObject {
                 running.append(SessionItem(id: s.id, title: s.title, running: true, background: true, edgeAt: s.edgeAt))
                 continue
             }
-            if let note = s.blockedNote, !s.isRoutine, now - s.edgeAt < 48 * 3600_000 {
-                wait(s, note); continue
-            }
+            let isUnread: Bool
             if let app {
                 if handMarked {
-                    if !dismissedExplicit.contains(s.id) { unread.append(item) }
-                } else if app.unread.contains(s.id) && now - s.edgeAt < 48 * 3600_000
-                            && (seen[s.id] ?? 0) < s.edgeAt {
-                    unread.append(item)
+                    isUnread = !dismissedExplicit.contains(s.id)
+                } else {
+                    isUnread = app.unread.contains(s.id) && now - s.edgeAt < 48 * 3600_000
+                        && (seen[s.id] ?? 0) < s.edgeAt
                 }
             } else {
                 let lastRead = max(s.focusAt, seen[s.id] ?? 0)
-                if s.edgeAt > lastRead + 1000 && now - s.edgeAt < 48 * 3600_000 {
-                    unread.append(item)
-                }
+                isUnread = s.edgeAt > lastRead + 1000 && now - s.edgeAt < 48 * 3600_000
+            }
+            guard isUnread else { continue }
+            if let note = s.blockedNote, !s.isRoutine {
+                wait(s, note)
+            } else {
+                unread.append(item)
             }
         }
         return (waiting.sorted { $0.edgeAt > $1.edgeAt },
@@ -819,7 +812,7 @@ struct RowView: View {
                         .foregroundColor(.white.opacity(0.7))
                 }
                 .buttonStyle(.plain)
-                .help(item.waiting ? "Hide until it asks again" : "Mark as read")
+                .help("Mark as read")
             } else {
                 Text(relative(item))
                     .font(.system(size: 11, weight: item.waiting ? .semibold : .regular, design: .rounded))
@@ -1119,7 +1112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let url = URL(string: "claude://claude.ai/epitaxy/\(item.id)") {
             NSWorkspace.shared.open(url)
         }
-        if !item.waiting { store.markSeen([item.id]) }
+        store.markSeen([item.id])
         setExpanded(false)
         layout(animated: true)
         // The app writes lastFocusedAt once the conversation is shown; rescan shortly after.
