@@ -22,7 +22,7 @@ build: $(BIN)
 
 # Regenerate the artwork with `make icon` after editing make_icon.swift.
 icon:
-	cd Resources/icon && swift make_icon.swift icon_1024.png
+	cd Resources/icon && swift make_icon.swift icon_1024.png clay
 
 $(ICNS): $(ICON_PNG)
 	@mkdir -p $(ICONSET)
