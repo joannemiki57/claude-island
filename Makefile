@@ -1,6 +1,6 @@
 APP_NAME  := ClaudeIsland
 BUNDLE_ID := io.github.joannemiki57.claudeisland
-VERSION   := 1.1.0
+VERSION   := 1.1.1
 MIN_MACOS := 13.0
 
 BUILD := build
