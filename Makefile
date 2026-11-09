@@ -59,7 +59,7 @@ uninstall: unlogin
 	@echo "Uninstalled."
 
 zip: build
-	cd $(BUILD) && rm -f $(APP_NAME)-$(VERSION).zip && ditto -c -k --keepParent $(APP_NAME).app $(APP_NAME)-$(VERSION).zip
+	cd $(BUILD) && rm -f $(APP_NAME)-$(VERSION).zip && ditto -c -k --norsrc --noextattr --noacl --keepParent $(APP_NAME).app $(APP_NAME)-$(VERSION).zip
 	@echo "$(BUILD)/$(APP_NAME)-$(VERSION).zip"
 
 clean:
