@@ -99,6 +99,12 @@ These are internal files of the Claude app, not a public API. An app update coul
 
 **Nothing shows up.** Make sure the Claude desktop app is installed and you've used the Code tab at least once.
 
+**A session shows up in the wrong place.** Print how the app sorts your sessions right now:
+
+```bash
+/Applications/ClaudeIsland.app/Contents/MacOS/ClaudeIsland --dump
+```
+
 **The unread list doesn't match Claude's sidebar.** Run this to print what the app reads from Claude's storage:
 
 ```bash
